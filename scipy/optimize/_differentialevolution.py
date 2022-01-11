@@ -24,7 +24,7 @@ def differential_evolution(func, bounds, args=(), strategy='best1bin',
                            mutation=(0.5, 1), recombination=0.7, seed=None,
                            callback=None, disp=False, polish=True,
                            init='latinhypercube', atol=0, updating='immediate',
-                           workers=1, constraints=(), x0=None):
+                           workers=1, constraints=(), x0=None, pop_eval_by_list=False):
     """Finds the global minimum of a multivariate function.
 
     Differential Evolution is stochastic in nature (does not use gradient
@@ -325,7 +325,8 @@ def differential_evolution(func, bounds, args=(), strategy='best1bin',
                                      updating=updating,
                                      workers=workers,
                                      constraints=constraints,
-                                     x0=x0) as solver:
+                                     x0=x0,
+                                     pop_eval_by_list=pop_eval_by_list) as solver:
         ret = solver.solve()
 
     return ret
@@ -511,7 +512,9 @@ class DifferentialEvolutionSolver:
                  tol=0.01, mutation=(0.5, 1), recombination=0.7, seed=None,
                  maxfun=np.inf, callback=None, disp=False, polish=True,
                  init='latinhypercube', atol=0, updating='immediate',
-                 workers=1, constraints=(), x0=None):
+                 workers=1, constraints=(), x0=None, pop_eval_by_list=False):
+
+        self.pop_eval_by_list = pop_eval_by_list
 
         if strategy in self._binomial:
             self.mutation_func = getattr(self, self._binomial[strategy])
@@ -1140,52 +1143,116 @@ class DifferentialEvolutionSolver:
 
         if self._updating == 'immediate':
             # update best solution immediately
-            for candidate in range(self.num_population_members):
-                if self._nfev > self.maxfun:
-                    raise StopIteration
 
-                # create a trial solution
-                trial = self._mutate(candidate)
+            if self.pop_eval_by_list:
+                parameters_list_for_mod = []
+                trial_list_for_mod = []
+                for candidate in range(self.num_population_members):
+                    # create a trial solution
+                    trial = self._mutate(candidate)
 
-                # ensuring that it's in the range [0, 1)
-                self._ensure_constraint(trial)
+                    # ensuring that it's in the range [0, 1)
+                    self._ensure_constraint(trial)
 
-                # scale from [0, 1) to the actual parameter value
-                parameters = self._scale_parameters(trial)
+                    # scale from [0, 1) to the actual parameter value
+                    parameters = self._scale_parameters(trial)
 
-                # determine the energy of the objective function
-                if self._wrapped_constraints:
-                    cv = self._constraint_violation_fn(parameters)
-                    feasible = False
-                    energy = np.inf
-                    if not np.sum(cv) > 0:
-                        # solution is feasible
+                    parameters_list_for_mod.append(parameters)
+
+                    trial_list_for_mod.append(trial)
+
+                energy_list_for_param_mod = self.func(parameters_list_for_mod)
+
+                for candidate in range(self.num_population_members):
+                    if self._nfev > self.maxfun:
+                        raise StopIteration
+
+                    trial = trial_list_for_mod[candidate]
+                    parameters = parameters_list_for_mod[candidate]
+
+                    # determine the energy of the objective function
+                    if self._wrapped_constraints:
+                        cv = self._constraint_violation_fn(parameters)
+                        feasible = False
+                        energy = np.inf
+                        if not np.sum(cv) > 0:
+                            # solution is feasible
+                            feasible = True
+                            # energy = self.func(parameters)
+                            energy = energy_list_for_param_mod[candidate]
+                            self._nfev += 1
+                    else:
                         feasible = True
+                        cv = np.atleast_2d([0.])
+                        energy = energy_list_for_param_mod[candidate]
+                        self._nfev += 1
+                    
+                # for candidate in range(self.num_population_members):
+                    # compare trial and population member
+                    if self._accept_trial(energy, feasible, cv,
+                                        self.population_energies[candidate],
+                                        self.feasible[candidate],
+                                        self.constraint_violation[candidate]):
+                        self.population[candidate] = trial
+                        self.population_energies[candidate] = energy
+                        self.feasible[candidate] = feasible
+                        self.constraint_violation[candidate] = cv
+
+                        # if the trial candidate is also better than the best
+                        # solution then promote it.
+                        if self._accept_trial(energy, feasible, cv,
+                                            self.population_energies[0],
+                                            self.feasible[0],
+                                            self.constraint_violation[0]):
+                            self._promote_lowest_energy()
+            
+            else:
+                for candidate in range(self.num_population_members):
+                    if self._nfev > self.maxfun:
+                        raise StopIteration
+
+                    # create a trial solution
+                    trial = self._mutate(candidate)
+
+                    # ensuring that it's in the range [0, 1)
+                    self._ensure_constraint(trial)
+
+                    # scale from [0, 1) to the actual parameter value
+                    parameters = self._scale_parameters(trial)
+
+                    # determine the energy of the objective function
+                    if self._wrapped_constraints:
+                        cv = self._constraint_violation_fn(parameters)
+                        feasible = False
+                        energy = np.inf
+                        if not np.sum(cv) > 0:
+                            # solution is feasible
+                            feasible = True
+                            energy = self.func(parameters)
+                            self._nfev += 1
+                    else:
+                        feasible = True
+                        cv = np.atleast_2d([0.])
                         energy = self.func(parameters)
                         self._nfev += 1
-                else:
-                    feasible = True
-                    cv = np.atleast_2d([0.])
-                    energy = self.func(parameters)
-                    self._nfev += 1
 
-                # compare trial and population member
-                if self._accept_trial(energy, feasible, cv,
-                                      self.population_energies[candidate],
-                                      self.feasible[candidate],
-                                      self.constraint_violation[candidate]):
-                    self.population[candidate] = trial
-                    self.population_energies[candidate] = np.squeeze(energy)
-                    self.feasible[candidate] = feasible
-                    self.constraint_violation[candidate] = cv
-
-                    # if the trial candidate is also better than the best
-                    # solution then promote it.
+                    # compare trial and population member
                     if self._accept_trial(energy, feasible, cv,
-                                          self.population_energies[0],
-                                          self.feasible[0],
-                                          self.constraint_violation[0]):
-                        self._promote_lowest_energy()
+                                        self.population_energies[candidate],
+                                        self.feasible[candidate],
+                                        self.constraint_violation[candidate]):
+                        self.population[candidate] = trial
+                        self.population_energies[candidate] = np.squeeze(energy)
+                        self.feasible[candidate] = feasible
+                        self.constraint_violation[candidate] = cv
+
+                        # if the trial candidate is also better than the best
+                        # solution then promote it.
+                        if self._accept_trial(energy, feasible, cv,
+                                            self.population_energies[0],
+                                            self.feasible[0],
+                                            self.constraint_violation[0]):
+                            self._promote_lowest_energy()
 
         elif self._updating == 'deferred':
             # update best solution once per generation
